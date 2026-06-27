@@ -1,0 +1,23 @@
+# Secrets / credentials (RunPod API keys, OpenAI-compatible keys, etc.)
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+**/credentials*.json
+
+# Python (for future request scripts / benchmarks)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
