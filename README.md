@@ -233,6 +233,29 @@ FlashBoot = enabled
 
 ## 9. 測試計畫
 
+### Phase 0: 本地 8GB context 上限驗證（已完成）
+
+正式租 GPU 前，先在本機 **RTX 3060 8GB** 用 llama.cpp（GGUF `Q4_K_M`）驗證「KV cache 量化能換到多少可用 context」，作為 vLLM 路線的對照基準。完整方法與數據見 [`PHASE0_LOCAL_REPORT.md`](PHASE0_LOCAL_REPORT.md)、原始數據 `_local-test/results/results.csv`、harness `_local-test/scripts/run_sweep.ps1`。
+
+關鍵結論：
+
+- 8GB 顯卡的限制**不是 OOM crash，而是 prefill 吞吐崩塌的效能懸崖**——Windows WDDM 在顯存不足時把 KV 溢位到系統 RAM（走 PCIe），效能直接掉下去而非報錯。
+- **懸崖落點由 KV cache dtype 決定，量化每減半、可用 context 約翻倍**：
+
+  | KV dtype | 穩定可用 context | 天花板 |
+  |---|---:|---:|
+  | f16 | 65k | 98k（VRAM 懸崖）|
+  | q8_0 | 98k | 131k（VRAM 懸崖）|
+  | q4_0 | **131k** | 196k（VRAM 懸崖）|
+  | q4_0 + CPU offload | 196k（但極慢）| 262k（系統 RAM 榨乾 → timeout）|
+
+- **在懸崖點 q4_0 的 needle 檢索從 3/3 掉到 0/3**：天花板處是吞吐與檢索品質一起崩，不只是變慢。
+- CPU offload（D）的瓶頸機制不同——VRAM 不會爆，但 KV 擠進系統 RAM，262k 時 16GB RAM 榨乾、prefill 跑不完，且 decode 早已掉到 6–8 t/s；實證它只能當「避免失敗」的保命 fallback。
+- 這實證了本計畫的策略順序（§7）：先用量化 KV cache 換 context、CPU offload 只能保命不能當效能配置。**對應到 vLLM 即 `KV_CACHE_DTYPE=fp8` 應優先於升級 GPU**；而下方各 Phase 拉高 `MAX_MODEL_LEN` 時，必須在每一階同時檢查長 context 檢索品質，不能只看 server 沒掛。
+
+> **本機最適配置：`q4_0` KV + 全層上 GPU（`-ngl 99`），131k context 內又快又準。**
+> 開箱即用：`serve_local.ps1`（啟 llama.cpp OpenAI server，預設即此配置）＋ `client/chat_client.py` 做零成本人工測試；同一個 client 加 `--target runpod` 即可測雲端 endpoint。完整用法見 `PHASE0_LOCAL_REPORT.md` §6。
+
 ### Phase 1: 64k POC
 
 - GPU：A100 80GB
