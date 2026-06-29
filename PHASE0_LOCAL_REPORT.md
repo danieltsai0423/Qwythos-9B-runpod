@@ -17,8 +17,9 @@
 - 在 8GB 顯卡上，限制可用 context 長度的不是「會不會 crash」，而是 **prefill 吞吐崩塌的效能懸崖**。
 - Windows WDDM 驅動在顯存不足時會把 KV / compute buffer 溢位到系統 RAM（走 PCIe），所以**整段 ladder 都沒有出現硬性 OOM**，而是效能直接掉下去。
 - **懸崖落點完全由 KV cache dtype 決定**：把 KV cache 減半（f16 → q8 → q4），穩定可用 context 大致翻倍：**65k → 98k → 131k**。
-- 這次把 ladder 延伸到 196k / 262k，**四個組態的真正懸崖全部測到**（前一版只到 131k，q4 還沒見底）：
-  - **A_f16 懸崖在 98k、B_q8 在 131k、C_q4 在 196k**；CPU offload 的 D_q4_off 到 196k 仍穩定。
+- 這次把 ladder 延伸到 196k / 262k，**四個組態的天花板全部測到**（前一版只到 131k，q4 還沒見底）：
+  - **A_f16 懸崖在 98k、B_q8 在 131k、C_q4 在 196k**（皆為 VRAM 溢位的吞吐懸崖）。
+  - **D_q4_off（CPU offload）的瓶頸機制不同**：它 VRAM 一路壓在 8GB 以下不會踩 VRAM 線，但 196k 穩定、**262k 時系統 RAM 衝到 15.67/15.84GB 榨乾，1800s 內連 prefill 都跑不完 → `timeout`**。換言之它的天花板是**系統 RAM**，不是 VRAM。
 - **新發現（多位置 needle）**：C_q4 在懸崖點 196k，needle 從 3/3 掉到 **0/3**——代表那個點不是「能跑只是慢」，而是**長 context 檢索品質與吞吐一起崩**。這比上一版只看吞吐更完整。
 - 這直接驗證了 README 的 **「KV cache 優先」策略順序**：`MAX_MODEL_LEN` → `KV_CACHE_DTYPE=fp8` → 升級更大 VRAM → 最後才 CPU offload。
 
@@ -77,7 +78,7 @@
 | 98k | **111** ⬇ | 1215 | 1183 | 908 |
 | 131k | — | **78** ⬇ | 1092 | 853 |
 | 196k | — | — | **266** ⬇ | 760 |
-| 262k | — | — | — | 未測 |
+| 262k | — | — | — | **timeout** ⬇（RAM 榨乾，prefill 未完成）|
 
 ### 4.2 Decode 吞吐（tokens/sec）
 
@@ -111,10 +112,12 @@
 | 98k | 3/3 | 3/3 | 3/3 | **1/3** |
 | 131k | — | 3/3 | 3/3 | 3/3 |
 | 196k | — | — | **0/3** ⬅ | 3/3 |
+| 262k | — | — | — | timeout（無輸出）|
 
-> 健康區間（未踩懸崖）幾乎都 3/3。兩個例外：
+> 健康區間（未踩懸崖）幾乎都 3/3。例外：
 > - **C_q4 @196k = 0/3**：與吞吐懸崖同點發生，是**檢索品質一起崩**，不只是變慢。
 > - **D_q4_off @98k = 1/3**：孤立一格、前後都 3/3，研判是 temp 0.6 取樣的隨機 miss，非系統性退化。
+> - **D_q4_off @262k = timeout**：1800s 內 prefill 未完成、無輸出可檢索（RAM 榨乾，見 §4.5）。
 
 ### 4.5 各組態總結
 
@@ -123,7 +126,7 @@
 | **C_q4** | q4_0 | **131k** | **196k** | 最佳。131k 仍有 1092 t/s prefill、25.1 decode；196k 一次崩光（266 t/s + needle 0/3） |
 | **B_q8** | q8_0 | **98k** | **131k** | 98k 前穩定（1215 t/s）；131k 掉到 78 t/s prefill / 16.7 decode |
 | **A_f16** | f16 | **65k** | **98k** | 65k 後崩塌：prefill 1275→111 t/s、decode 掉到 6.5 |
-| **D_q4_off** | q4_0 + offload | **≥196k** | 未觸及（262k 未測） | 全程穩定但慢（decode 15→6.4 t/s）。屬「避免失敗」的保命組態，非效能組態 |
+| **D_q4_off** | q4_0 + offload | **196k** | **262k（RAM timeout）** | 唯一靠 RAM 換 context 的組態：196k 仍能跑（但 decode 僅 6.4 t/s）；262k 把系統 RAM 榨乾、prefill 跑不完。屬「避免失敗」的保命組態，非效能組態 |
 
 ---
 
@@ -136,21 +139,58 @@
 
 ---
 
-## 6. 限制與下一步
+## 6. 本機最適配置與用法
 
-**本報告限制**
+**結論：本機（RTX 3060 8GB）的最佳日常配置是 `C_q4`——KV cache 用 `q4_0`、全部層上 GPU（`-ngl 99`）。**
 
-- D_q4_off 的 262k 一格未測（手動暫停掃描時停在這裡）；其餘三組態的懸崖都已測得。
-- 為本機 Q4_K_M GGUF + llama.cpp，**非** RunPod 上的 vLLM + 原始權重；數值僅供策略方向對照，不能直接換算雲端表現。
-- needle 是合成密語檢索，非長文摘要 / 推理等更難的品質基準；temp 0.6 下單格仍有取樣雜訊（見 D@98k）。
+理由：在 8GB VRAM 上，它在「可用 context」和「速度」之間取得最好的平衡——
 
-**建議下一步**
+| | A_f16 | B_q8 | **C_q4（建議）** | D_q4_off |
+|---|---|---|---|---|
+| 穩定 context | 65k | 98k | **131k** | 196k（但極慢）|
+| 131k 時 prefill | 崩 | 崩 | **1092 t/s** | 853 t/s |
+| 131k 時 decode | 崩 | 16.7 t/s | **25.1 t/s** | 7.8 t/s |
+| 檢索品質 | 好 | 好 | **好（131k 內 3/3）** | 好但 decode 太慢 |
 
-1. 視需要補測 D_q4_off @262k 單格（harness 無斷點續跑，但可只跑這一格）。
-2. 把本報告精簡後併入 `README.md`（依 CONTRIBUTING 走 PR-first）。
-3. 把 harness 修正與 `results.csv` 以 PR 方式納入版控（`_local-test/` 目前被 gitignore，需對 scripts 與 csv 開例外，排除 GGUF 與 llama.cpp 執行檔）。
-4. 進入 RunPod 路線：用 `client/chat_client.py --target runpod`，填入 `ENDPOINT_ID` 與 API key 即可測同一套 OpenAI-compatible 介面。
+- **A/B（f16/q8）**：沒量化到位，context 太早就撞懸崖，浪費了 8GB 的潛力。
+- **D（offload）**：能換到更長 context（196k），但 decode 掉到 6–8 t/s、且 262k 直接被 RAM 拖垮 timeout——只適合「寧可慢也不要失敗」的保命情境，不適合日常互動。
+- **C_q4**：131k 內又快又準，是這台機器的甜蜜點。要超過 131k 才退而求其次用 D。
+
+### 怎麼用
+
+本機已備好兩個介面，**KV 預設就是 C_q4 配置**（`q4_0` + `-ngl 99`），開箱即用：
+
+```powershell
+# 1) 啟動本機 llama.cpp OpenAI server（含瀏覽器聊天 UI）
+#    預設 ctx=32768；VRAM 有餘裕可加 -Context（131072 內都安全）
+powershell -ExecutionPolicy Bypass -File _local-test\scripts\serve_local.ps1 -Context 131072
+
+#    → 瀏覽器 UI : http://127.0.0.1:8080
+#    → OpenAI API: http://127.0.0.1:8080/v1   (model: qwythos-9b)
+
+# 2) 另開視窗，用 CLI 聊天 / 煙霧測試
+python client\chat_client.py --target local
+python client\chat_client.py --target local --once "用一句話自我介紹"
+```
+
+> 同一支 `chat_client.py` 之後加 `--target runpod`（配 `RUNPOD_ENDPOINT_ID` / `RUNPOD_API_KEY`）就能測雲端 endpoint——本機與雲端只差 `base_url` / `api_key`，正是本計畫的架構。
 
 ---
 
-*數據來源：`_local-test/results/results.csv`（29 列，4 組態 × 8–9 階 context）。本報告為初步版本，數值為單次掃描結果。*
+## 7. 限制與下一步
+
+**本報告限制**
+
+- 為本機 Q4_K_M GGUF + llama.cpp，**非** RunPod 上的 vLLM + 原始權重；數值僅供策略方向對照，不能直接換算雲端表現。
+- needle 是合成密語檢索，非長文摘要 / 推理等更難的品質基準；temp 0.6 下單格仍有取樣雜訊（見 D@98k）。
+- 各天花板為單次掃描結果，未做重複量測取統計。
+
+**建議下一步**
+
+1. 把本報告精簡後併入 `README.md`（依 CONTRIBUTING 走 PR-first）。
+2. 把 harness 修正與 `results.csv` 以 PR 方式納入版控（`_local-test/` 目前被 gitignore，需對 scripts 與 csv 開例外，排除 GGUF 與 llama.cpp 執行檔）。
+3. 進入 RunPod 路線：用 `client/chat_client.py --target runpod`，填入 `ENDPOINT_ID` 與 API key 即可測同一套 OpenAI-compatible 介面。
+
+---
+
+*數據來源：`_local-test/results/results.csv`（30 列，4 組態 × 8–9 階 context）。本報告為初步版本，數值為單次掃描結果。*
