@@ -9,8 +9,9 @@
 # it, and so does any OpenAI SDK by pointing base_url here.
 #
 # KV cache defaults to q4_0 -- the sweep's best config on this 8GB GPU (longest context
-# per VRAM byte with no throughput cliff through 131k). Context defaults to 32768 to leave
-# headroom; raise -Context if you have VRAM to spare.
+# per VRAM byte with no throughput cliff through 131k). Context defaults to 65536 (~6.8GB
+# VRAM, comfortably safe) for long-doc testing out of the box; raise -Context toward 131k
+# if you have VRAM to spare, or lower it if anything else needs the GPU.
 #
 # !! DO NOT run this while run_sweep.ps1 is active -- both want the GPU and will OOM. !!
 #
@@ -19,7 +20,7 @@
 #   powershell -ExecutionPolicy Bypass -File .\serve_local.ps1 -Context 65536 -Port 8080
 
 param(
-    [int]$Context = 32768,
+    [int]$Context = 65536,
     [int]$Port    = 8080,
     [string]$Host_ = "127.0.0.1",
     [string]$Ctk   = "q4_0",

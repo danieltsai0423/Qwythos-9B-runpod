@@ -29,7 +29,7 @@ powershell -ExecutionPolicy Bypass -File .\serve_local.ps1 -Context 65536 -Port 
 - **瀏覽器聊天 UI**：<http://127.0.0.1:8080>（llama.cpp 內建，最直覺的人工測試）
 - **OpenAI API**：`http://127.0.0.1:8080/v1`，model 名稱 `qwythos-9b`
 
-KV cache 預設 `q4_0`——掃描測出在本機 8GB GPU 上最佳（每 VRAM byte 換到最長 context、131k 內無效能懸崖）。context 預設 32768，VRAM 有餘裕可調高。
+KV cache 預設 `q4_0`——掃描測出在本機 8GB GPU 上最佳（每 VRAM byte 換到最長 context、131k 內無效能懸崖）。context 預設 65536（約 6.8GB VRAM，安全），VRAM 有餘裕可往 131k 調高。
 
 ### 2. 用 CLI 聊天
 
