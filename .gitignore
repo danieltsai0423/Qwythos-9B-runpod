@@ -21,3 +21,19 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Local agent/editor state
+.claude/
+
+# Local llama.cpp test artifacts
+_local-test/llamacpp/
+_local-test/models/
+_local-test/prompts/
+# Ignore everything under results/ (per-cell logs) EXCEPT the committed summary CSV
+_local-test/results/*
+!_local-test/results/results.csv
+*.gguf
+*.gguf.*
+*.safetensors
+*.pt
+*.pth
