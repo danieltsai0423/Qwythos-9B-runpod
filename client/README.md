@@ -56,6 +56,49 @@ python client\chat_client.py --target runpod
 
 ---
 
+## C. 本機檔案 agent（讓模型操作沙箱檔案）
+
+`chat_client.py` 只會聊天；要讓模型**實際讀寫本機檔案**（像 coding agent），需要一層「工具執行迴圈」。這裡提供兩種，能力相同、都**嚴格 jail 在單一沙箱目錄**內：
+
+| 工具 | 介面 | 用途 |
+|---|---|---|
+| `file_agent.py` | CLI | 命令列直接對模型下指令操作檔案 |
+| `agent_proxy.py` | 瀏覽器 | 在 llama.cpp web UI 和伺服器中間插代理，讓**瀏覽器 UI** 也能操作檔案 |
+
+**安全邊界（兩者共用）**：所有路徑先 `realpath`（解掉 `..` 與 symlink）再驗證必須落在沙箱內，越界一律在動硬碟前拒絕；只開放 `list_dir / read_file / write_file / make_dir`，**沒有刪除、沒有 shell**。沙箱預設 `C:\Users\User\Desktop\Road to AU\mini game`，用 `--root` 可換。
+
+### C-1. CLI agent
+
+```powershell
+python client\file_agent.py                       # 互動模式（jail 在預設沙箱）
+python client\file_agent.py --once "用 Python 寫一個猜數字遊戲存成 game.py"
+python client\file_agent.py --root "C:\其他\專案"   # 換沙箱
+```
+每個工具動作會即時印在畫面（`· write_file(game.py) -> ok`），看得到它動了什麼。
+
+### C-2. 瀏覽器 UI 加上檔案能力（proxy）
+
+llama.cpp 的 web UI 是編進 `llama-server.exe` 的靜態檔、改不動，所以改用「不碰 UI」的代理法：
+
+```
+瀏覽器 (開 :8081) → agent_proxy → llama-server (:8080)
+                      ↑ 工具迴圈在這裡跑，jail 在沙箱
+```
+
+```powershell
+# 視窗1：模型伺服器（照舊）
+powershell -ExecutionPolicy Bypass -File _local-test\scripts\serve_local.ps1 -Context 65536
+# 視窗2：agent proxy（預設上游 :8080、jail 在預設沙箱）
+python client\agent_proxy.py
+# 然後瀏覽器開 http://127.0.0.1:8081   ← 注意是 8081，不是 8080
+```
+
+UI 用相對路徑呼叫 API，所以改開 proxy 的 port 後，每則訊息都會經過 proxy：它注入檔案工具、跑完讀寫迴圈，只把最終答案（開頭加一行 `🔧 動過哪些檔`）串流回 UI。你照常聊天，檔案操作透明發生。
+
+> ⚠️ 這是 **9B 本地模型**：簡單建檔/讀改沒問題，複雜多步驟容易亂呼叫工具或不收尾，建議盯著。
+
+---
+
 ## chat_client.py 互動指令
 
 | 指令 | 說明 |
