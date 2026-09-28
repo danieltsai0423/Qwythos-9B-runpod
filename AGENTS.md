@@ -1,46 +1,79 @@
-# Repository Guidelines
+# AGENTS.md — Qwythos-9B on RunPod Serverless
 
-## Project Structure & Module Organization
+Guidance for coding agents (Claude Code, Codex, Devin) working in this repository. This file is the single source of project rules; `CLAUDE.md` only imports it via `@AGENTS.md`.
 
-This repository currently contains deployment notes for running Qwythos-9B on RunPod Serverless. The main reference is `README.md`, which documents the intended model, vLLM environment variables, RunPod endpoint behavior, GPU sizing, and rollout phases.
+> 2026-09-28: merged from the former `CLAUDE.md` (the plan-specific guide, kept verbatim below) and the former `AGENTS.md` (generic repository guidelines, folded into "Conventions for future code"). Originals are backed up in `C:\Users\User\agent-config-backup-20260928\projects\Qwythos-9B RunPod Serverless\`.
 
-There is no source package, test suite, or assets directory yet. If executable code is added, keep it organized by purpose, for example:
+## What this repository is
 
-- `src/` for application or worker code.
-- `tests/` for automated tests.
-- `scripts/` for setup, smoke tests, or deployment helpers.
-- `docs/` for longer operational notes beyond the README.
+This is a **planning / specification repository**, not a software project. It currently contains a single document, `README.md`, written in Traditional Chinese, that specifies how to deploy the model `empero-ai/Qwythos-9B-Claude-Mythos-5-1M` ("Qwythos-9B") on **RunPod Serverless** and call it from a local machine via an OpenAI-compatible API.
 
-## Build, Test, and Development Commands
+There is no build, lint, or test tooling — there is no source code. Work here means editing the plan in `README.md` (or adding deployment artifacts such as request scripts or endpoint config). Keep new prose consistent with the existing Traditional Chinese style unless asked otherwise.
 
-No build system is configured in this repository. For documentation-only edits, there is no required build step.
+## Core architecture decision
 
-Useful checks when tooling is available:
+The local machine runs **only the client/agent/application**, never the model. All inference happens on a cloud GPU behind a RunPod Serverless endpoint:
 
-- `git diff -- README.md AGENTS.md` reviews documentation changes.
-- `npx markdownlint-cli2 "**/*.md"` checks Markdown formatting if Node tooling is available.
-- `python -m pytest` should be used only after a Python test suite is introduced.
+```
+Local app/agent → OpenAI-compatible request → RunPod Serverless Endpoint → vLLM worker → Qwythos-9B on cloud GPU
+```
 
-Document any new required command in `README.md` when adding code or automation.
+- Base URL: `https://api.runpod.ai/v2/{ENDPOINT_ID}/openai/v1`
+- Served model name: `qwythos-9b` (overrides the full HF repo name)
+- Runtime: **vLLM**, **Queue-based** endpoint (not Load Balancer) — chosen because long-context prefill is slow and the `/run` `/runsync` `/status` `/stream` queue modes handle long tasks better.
 
-## Coding Style & Naming Conventions
+## Scale-to-zero on-demand cost model
 
-Use Markdown headings in sentence or title case and keep sections short. Prefer fenced code blocks with language tags where applicable, such as `text`, `bash`, or `python`.
+The whole point of the design is "GPU runs only while in use." This is achieved with endpoint settings `Active workers=0`, `Max workers=1`, `Idle timeout=5–30s`, `FlashBoot=enabled`, cached model enabled. The first request triggers a cold start (container + model load); the worker auto-stops after idle timeout. **Billing covers cold start, execution, and the idle-timeout window** — idle timeout is not free.
 
-For future code, use clear module names that describe deployment behavior, for example `runpod_client.py`, `smoke_test.py`, or `serverless_worker.py`. Keep configuration examples explicit and uppercase environment variables, such as `MAX_MODEL_LEN`, `KV_CACHE_DTYPE`, and `RUNPOD_API_KEY`.
+## The central technical constraint: KV cache, not model weights
 
-## Testing Guidelines
+Qwythos-9B is only ~9B params; what makes its claimed ~1M context hard is **KV cache growth**, not weight size. Any decision in this repo about context length, GPU choice, or memory flags should be reasoned about in terms of KV cache. The committed strategy, in strict priority order:
 
-There are no automated tests yet. When code is added, include focused tests under `tests/` and name them after the behavior being verified, for example `test_openai_compatible_request.py`.
+1. Limit `MAX_MODEL_LEN`.
+2. Enable `KV_CACHE_DTYPE=fp8` (only under long-context stress testing).
+3. Upgrade to a larger-VRAM GPU.
+4. CPU swap/offload (`SWAP_SPACE`) only as a last-resort fallback to avoid hard failure — **never** as a daily performance config.
 
-For deployment scripts, include a lightweight smoke test that verifies the configured RunPod endpoint responds through the OpenAI-compatible API using model name `qwythos-9b`.
+CPU KV offload is explicitly rejected as a primary approach because it moves KV access onto the CPU/RAM/PCIe path and badly hurts long-context latency. (The `llama.cpp` flags `--no-kv-offload`, `-ctk q4_0`, `-ctv q4_0` are mentioned only as a separate local RTX 4060 8GB extreme-test technique, not part of the RunPod path.)
 
-## Commit & Pull Request Guidelines
+## Context-length ramp — do not skip steps
 
-This directory has no local Git history, so no existing commit convention can be inferred. Use short, imperative commit messages such as `Add RunPod smoke test` or conventional prefixes such as `docs: update deployment notes`.
+Never start at 1M context. Raise `MAX_MODEL_LEN` one tier at a time and confirm stability before advancing, or cold starts will OOM during KV-cache init and waste startup cost:
 
-Pull requests should include a concise summary, validation steps performed, and any operational impact. For configuration changes, mention affected variables, expected GPU class, context length target, and whether secrets or endpoint IDs were changed.
+```
+65536 → 131072 → 262144 → 512000 → 1010000
+```
 
-## Security & Configuration Tips
+This maps to the four test phases in the README: 64k POC (A100 80GB) → 128k/262k → 512k (switch to H100/H200, enable fp8) → near-1M (H200/B200, async `/run` only, may end up "experiment only").
+
+## First-version vLLM environment variables
+
+```
+MODEL_NAME=empero-ai/Qwythos-9B-Claude-Mythos-5-1M
+OPENAI_SERVED_MODEL_NAME_OVERRIDE=qwythos-9b
+DTYPE=bfloat16
+TRUST_REMOTE_CODE=true
+MAX_MODEL_LEN=65536
+GPU_MEMORY_UTILIZATION=0.90
+```
+
+Add `KV_CACHE_DTYPE=fp8` only for long-context stress tests.
+
+## When updating this plan
+
+- GPU per-second prices in §4 are point-in-time and must be re-verified against the RunPod pricing page before any real deployment — flag them as stale rather than trusting them.
+- vLLM support for this model's architecture (Qwen3.5 / newer) is unconfirmed and must be validated against the actual worker image.
+- Reference docs (RunPod Serverless, pricing, endpoint config, vLLM OpenAI compatibility/env vars, and the HF model card) are linked in README §12.
+
+## Conventions for future code
+
+- If executable code is added, organize it by purpose: `src/` (worker or client code), `tests/` (automated tests), `scripts/` (setup, smoke tests, deployment helpers), `docs/` (operational notes beyond the README). Document any new required command in `README.md`.
+- Use clear module names that describe deployment behavior (e.g. `runpod_client.py`, `smoke_test.py`, `serverless_worker.py`) and explicit uppercase environment variables (`MAX_MODEL_LEN`, `KV_CACHE_DTYPE`, `RUNPOD_API_KEY`).
+- Deployment scripts get a lightweight smoke test that checks the endpoint answers through the OpenAI-compatible API with model name `qwythos-9b`. Name tests after the behavior (e.g. `test_openai_compatible_request.py`); run `python -m pytest` once a suite exists.
+- Markdown: short sections, fenced code blocks with language tags. Optional check when Node tooling is available: `npx markdownlint-cli2 "**/*.md"`.
+- Commits: short imperative messages (e.g. `Add RunPod smoke test`) or conventional prefixes (`docs: update deployment notes`). Change summaries list validation steps, operational impact, affected variables, expected GPU class, context-length target, and whether secrets or endpoint IDs changed.
+
+## Security
 
 Do not commit real RunPod API keys, endpoint IDs tied to private infrastructure, or Hugging Face tokens. Use placeholders like `{ENDPOINT_ID}` and document required variables separately from their values.
